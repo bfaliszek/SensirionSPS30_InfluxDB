@@ -1,54 +1,42 @@
-/*
-    =========================  SPS30 connection =================================
+#include <Arduino.h>
+#include "src/sps30.h"                                     // https://github.com/paulvha/sps30 // updated - 10.01.2020
+#include "src/InfluxDb.h"                                  // https://github.com/tobiasschuerg/ESP8266_Influx_DB // updated - 10.01.2020
 
-    Using serial port1, setting the RX-pin(13/D1) and TX-pin(15/D2)
-    Different setup can be configured in the sketch.
+int READ_DATA_EVERY_SECONDS = 20; // default 20 sec
+int SEND_DATA_EVERY_SECONDS = 60; // default 60 sec
 
-    SPS30 pin     ESP32
-    1 VCC -------- VUSB
-    2 RX  -------- TX  pin 13
-    3 TX  -------- RX  pin 25
-    4 Select      (NOT CONNECTED)
-    5 GND -------- GND
+#define INFLUXDB_HOST "XXX"
+#define INFLUXDB_DATABASE "XXX"
+#define INFLUXDB_USER "XXX"
+#define INFLUXDB_PASS "XXX"
+#define DEVICE_NAME "XXX"
 
-    NO level shifter is needed as the SPS30 is TTL 5V and LVTTL 3.3V compatible
+// WiFi Config
+#define WiFi_SSID "SSID"
+#define WiFi_Password "PASSWORD"
 
-*/
-#ifdef ARDUINO_ARCH_ESP8266
-#include <ESP8266WiFi.h>
-#include <ESP8266WiFiMulti.h>
-#include <Wire.h>
-#include "src/sps30.h" // https://github.com/paulvha/sps30 // 4.03.2019 - 1.3.2 // Copyright (c) - Paul van Haastrecht
-#include "src/ESPinfluxdb.h" // https://github.com/hwwong/ESP_influxdb // 3.02.2019
-ESP8266WiFiMulti WiFiMulti;
-#elif defined ARDUINO_ARCH_ESP32
-#include <WiFi.h>
-#include "src/sps30.h" // https://github.com/paulvha/sps30 // 4.03.2019 - 1.3.2 // Copyright (c) - Paul van Haastrecht
-#include "src/ESPinfluxdb.h" // https://github.com/hwwong/ESP_influxdb // 3.02.2019
+#ifdef ARDUINO_ARCH_ESP32
+#define RX_PIN 17           // D17
+#define TX_PIN 16           // D16
+#else
+#define RX_PIN 4            // D2
+#define TX_PIN 5            // D1
 #endif
 
-/////////////////////////////////////////////////////////////
+#ifdef ARDUINO_ARCH_ESP32
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HardwareSerial.h>
+#else
+#include <Wire.h>
+#include <ESP8266WiFi.h>
+#endif
 
 #define SP30_COMMS SERIALPORT1
-
-/////////////////////////////////////////////////////////////
-/* define RX and TX pin for softserial and Serial1 on ESP32
-   can be set to zero if not applicable / needed           */
-/////////////////////////////////////////////////////////////
-
-
-#ifdef ARDUINO_ARCH_ESP8266
-#define TX_PIN D1
-#define RX_PIN D2
-#elif defined ARDUINO_ARCH_ESP32
-#define TX_PIN 13
-#define RX_PIN 15
-#endif
 
 ///////////////////////////////////////////////////////////////
 /* define new AUTO Clean interval
    Will be remembered after power off
-
    default is 604800 seconds ~ 1 week
    0 = disable Auto Clean
    -1 = do not change current setting */
@@ -73,128 +61,120 @@ ESP8266WiFiMulti WiFiMulti;
 // create constructor
 SPS30 sps30;
 
-// WiFi – Config
-const char* WiFi_SSID = "SSID";
-const char* WiFi_Password = "PASSWORD";
+unsigned long previousMillis_READING, previousMillis_SENDING = 0;
 
-// InfluxDB – Config
-#define INFLUXDB_HOST "IP_INFLUXDB"
-#define INFLUXDB_PORT 8086
+float SPS_PM1, SPS_PM2, SPS_PM4, SPS_PM10;
 
-#define DATABASE  "mydb"
-#define DB_USER "USER"
-#define DB_PASSWORD "PASSWORD"
-Influxdb influxdb(INFLUXDB_HOST, INFLUXDB_PORT);
+unsigned long READING_INTERVAL = READ_DATA_EVERY_SECONDS * 1000;
+unsigned long SENDING_INTERVAL = SEND_DATA_EVERY_SECONDS * 1000;
 
-// Sleep time – send data every XX seconds
-const int sleepTime = 30;
+Influxdb influx(INFLUXDB_HOST);
 
-// Your device name!
-#define DEVICE_NAME "SensirionSPS30"
+void setup()
+{
+  Serial.begin(115000);                                    // Device to serial monitor feedback
 
-float PM1, PM2, PM4, PM10;
-
-void setup() {
-
-  Serial.begin(115200);
-
-  Serial.println(F("Trying to connect"));
-  
-    // set driver debug level
-    sps30.EnableDebugging(DEBUG);
-
-    // set pins to use for softserial and Serial1 on ESP32
-    if (TX_PIN != 0 && RX_PIN != 0) sps30.SetSerialPin(RX_PIN, TX_PIN);
-
-    // Begin communication channel;
-    if (sps30.begin(SP30_COMMS) == false) {
-      Errorloop("could not initialize communication channel.", 0);
-    }
-
-    // check for SPS30 connection
-    if (sps30.probe() == false) {
-      Errorloop("could not probe / connect with SPS30.", 0);
-    }
-    else
-      Serial.println(F("Detected SPS30."));
-
-    // reset SPS30 connection
-    if (sps30.reset() == false) {
-      Errorloop("could not reset.", 0);
-    }
-
-    // read device info
-    GetDeviceInfo();
-
-    // do Auto Clean interval
-    SetAutoClean();
-
-    // start measurement
-    if (sps30.start() == true)
-      Serial.println(F("Measurement started"));
-    else
-      Errorloop("Could NOT start measurement", 0);
-
-    // clean now requested
-    if (PERFORMCLEANNOW) {
-      // clean now
-      if (sps30.clean() == true)
-        Serial.println(F("fan-cleaning manually started"));
-      else
-        Serial.println(F("Could NOT manually start fan-cleaning"));
-    }
-
-    if (SP30_COMMS == I2C_COMMS) {
-      if (sps30.I2C_expect() == 4)
-        Serial.println(F(" !!! Due to I2C buffersize only the SPS30 MASS concentration is available !!! \n"));
-    }
-  
-#ifdef ARDUINO_ARCH_ESP8266
-  WiFi.mode(WIFI_STA);
-  WiFiMulti.addAP(WiFi_SSID, WiFi_Password);
+  WiFi.begin(WiFi_SSID, WiFi_Password);
   Serial.println();
   Serial.print("Waiting for WiFi... ");
-
-  while (WiFiMulti.run() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(500);
-  }
-#elif defined ARDUINO_ARCH_ESP32
-  WiFi.mode(WIFI_MODE_STA);
-  WiFi.begin(WiFi_SSID, WiFi_Password);
   while (WiFi.status() != WL_CONNECTED) {
-    Serial.print("Attempting to connect to WPA SSID: ");
-    Serial.println(WiFi_SSID);
-    // wait 5 seconds for connection:
-    Serial.print("Status = ");
-    Serial.println(WiFi.status());
-    Serial.println(" ");
+#ifdef ARDUINO_ARCH_ESP32
+    WiFi.begin(WiFi_SSID, WiFi_Password);
+#endif
+    Serial.println(".");
     delay(500);
   }
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  influx.setDbAuth(INFLUXDB_DATABASE, INFLUXDB_USER, INFLUXDB_PASS);
+
+#ifdef ARDUINO_ARCH_ESP32
+  disableCore0WDT();
+  //disableCore1WDT(); // ESP32-solo-1 so only CORE0!
 #endif
 
-  if (influxdb.opendb(DATABASE, DB_USER, DB_PASSWORD) != DB_SUCCESS) {
-    Serial.println("Connecting to database failed");
+  Serial.println(F("Trying to connect to SPS30..."));
+
+  // set driver debug level
+  sps30.EnableDebugging(DEBUG);
+
+  // set pins to use for softserial and Serial1 on ESP32
+  if (TX_PIN != 0 && RX_PIN != 0) sps30.SetSerialPin(RX_PIN, TX_PIN);
+
+  // Begin communication channel;
+  if (sps30.begin(SP30_COMMS) == false) {
+    Errorloop("could not initialize communication channel.", 0);
+  }
+
+  // check for SPS30 connection
+  if (sps30.probe() == false) {
+    Errorloop("could not probe / connect with SPS30.", 0);
+  }
+  else
+    Serial.println(F("Detected SPS30."));
+
+  // reset SPS30 connection
+  if (sps30.reset() == false) {
+    Errorloop("could not reset.", 0);
+  }
+
+  // read device info
+  GetDeviceInfo();
+
+  // do Auto Clean interval
+  SetAutoClean();
+
+  // start measurement
+  if (sps30.start() == true)
+    Serial.println(F("\nMeasurement started"));
+  else
+    Errorloop("Could NOT start measurement", 0);
+
+  // clean now requested
+  if (PERFORMCLEANNOW) {
+    // clean now
+    if (sps30.clean() == true)
+      Serial.println(F("fan-cleaning manually started"));
+    else
+      Serial.println(F("Could NOT manually start fan-cleaning"));
+  }
+
+  if (SP30_COMMS == I2C_COMMS) {
+    if (sps30.I2C_expect() == 4)
+      Serial.println(F(" !!! Due to I2C buffersize only the SPS30 MASS concentration is available !!! \n"));
+  }
+}
+
+void loop()
+{
+  yield();
+
+  unsigned long currentMillis_READING = millis();
+  if (currentMillis_READING - previousMillis_READING >= READING_INTERVAL) {
+    read_pm();
+    previousMillis_READING = millis();
+  }
+
+  unsigned long currentMillis_SENDING = millis();
+  if (currentMillis_SENDING - previousMillis_SENDING >= SENDING_INTERVAL) {
+    send_data();
+    previousMillis_SENDING = millis();
   }
 
 }
 
-void loop() {
-
-  read_pm();
-
-  dbMeasurement row(DEVICE_NAME);
-  row.addField("pm1", (PM1));
-  row.addField("pm2.5", (PM2));
-  row.addField("pm4", (PM4));
-  row.addField("pm10", (PM10));
-  if (influxdb.write(row) == DB_SUCCESS) {
-    Serial.println("Data send to InfluxDB\n\n");
-  }
-  row.empty();
-
-  delay(sleepTime * 1000);
+void send_data() {
+  Serial.println("\nSending data...");
+  InfluxData row(DEVICE_NAME);
+  row.addValue("PM1", (float(SPS_PM1)));
+  row.addValue("PM2.5", (float(SPS_PM2)));
+  row.addValue("PM4", (float(SPS_PM4)));
+  row.addValue("PM10", (float(SPS_PM10)));
+  influx.write(row);
 }
+
 
 /**
    @brief : read and display device info
@@ -206,8 +186,10 @@ void GetDeviceInfo()
 
   //try to read serial number
   ret = sps30.GetSerialNumber(buf, 32);
+
   if (ret == ERR_OK) {
     Serial.print(F("Serial number : "));
+
     if (strlen(buf) > 0)  Serial.println(buf);
     else Serial.println(F("not available"));
   }
@@ -315,22 +297,21 @@ bool read_pm()
 
   } while (ret != ERR_OK);
 
-  PM1 = val.MassPM1;
-  PM2 = val.MassPM2;
-  PM4 = val.MassPM4;
-  PM10 = val.MassPM10;
+  SPS_PM1 = val.MassPM1;
+  SPS_PM2 = val.MassPM2;
+  SPS_PM4 = val.MassPM4;
+  SPS_PM10 = val.MassPM10;
 
-  Serial.println("PM1: " + String(PM1) + " μg/m3");
-  Serial.println("PM2.5: " + String(PM2) + " μg/m3");
-  Serial.println("PM4: " + String(PM4) + " μg/m3");
-  Serial.println("PM10: " + String(PM10) + " μg/m3\n");
+  Serial.println("PM1: " + String(SPS_PM1) + " μg/m3");
+  Serial.println("PM2.5: " + String(SPS_PM2) + " μg/m3");
+  Serial.println("PM4: " + String(SPS_PM4) + " μg/m3");
+  Serial.println("PM10: " + String(SPS_PM10) + " μg/m3\n");
 }
 
 /**
   @brief : continued loop after fatal error
   @param mess : message to display
   @param r : error code
-
   if r is zero, it will only display the message
 */
 void Errorloop(char *mess, uint8_t r)
@@ -345,7 +326,6 @@ void Errorloop(char *mess, uint8_t r)
     @brief : display error message
     @param mess : message to display
     @param r : error code
-
 */
 void ErrtoMess(char *mess, uint8_t r)
 {
